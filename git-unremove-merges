@@ -1,0 +1,202 @@
+#!/usr/bin/env perl
+
+############################################################################
+# FILE:                git-unremove-merges                                 #
+# DESCRIPTION:         Un-remove merges from a linear series of commits    #
+# AUTHOR:              Jonathan G. Rennison <j.g.rennison@gmail.com>       #
+# LICENSE:             New BSD License, see LICENSE.txt                    #
+#                                                                          #
+# Copyright © Jonathan G. Rennison 2023                                    #
+############################################################################
+
+use strict;
+use warnings;
+
+use Proc::Hevy;
+use Getopt::Long;
+
+
+sub usage {
+	my ($fh, $retcode) = @_;
+	$fh //= \*STDERR;
+	$retcode //= 1;
+	print $fh <<'EOF';
+usage: git unremove-merges [options] <commit>
+
+    -b, --branch <branch> replace all uses of HEAD with <branch>
+    -n, --dry-run         print the new commit hash instead of resetting HEAD
+    -c, --keep-committer  preserve committer name, email and date
+    -v, --verbose         be verbose
+    -h, -?, --help        show this help
+
+This performs the opposite transformation to: git remove-merges.
+This re-adds merges from a linear sequence of commits from <commit> to HEAD.
+Parent commits are added from the commit message.
+The commits replaced are those given by `git log --ancestry-path --first-parent <commit>..HEAD`
+This does not touch the index or working tree.
+
+EOF
+	exit $retcode;
+}
+
+my ($branch, $dry_run, $keep_committer, $help);
+my $verbose = 0;
+
+Getopt::Long::Configure("no_auto_abbrev", "bundling");
+GetOptions (
+	"branch|b=s"   => \$branch,
+	"dry-run|n"    => \$dry_run,
+	"keep-committer|c" => \$keep_committer,
+	"help|h|?"     => \$help,
+	"verbose|v+"   => \$verbose,
+) or usage();
+
+usage(\*STDOUT, 0) if $help;
+
+usage() unless scalar @ARGV;
+if (scalar @ARGV > 1) {
+	print STDERR "Expected a single revision argument\n\n";
+	usage();
+}
+
+my ($branch_commit, $branch_name, $branch_ref, $status_branch);
+if (defined $branch) {
+	$branch_name = $branch;
+	$branch_ref = "refs/heads/$branch";
+	$status_branch = exec_wrapper(
+		command => [qw(git show-ref --hash --verify), $branch_ref],
+		stdout  => \$branch_commit,
+		stderr  => \*STDERR,
+	);
+} else {
+	$branch_name = "HEAD";
+	$branch_ref = "HEAD";
+	$status_branch = exec_wrapper(
+		command => [qw(git rev-parse --verify @)],
+		stdout  => \$branch_commit,
+		stderr  => \*STDERR,
+	);
+}
+exit($status_branch << 8) if $status_branch;
+chomp $branch_commit;
+
+my $input_ref = $ARGV[0] // usage();
+
+my $rev;
+my $status_rev_parse = exec_wrapper(
+	command => [qw(git rev-parse --verify), "$input_ref^{commit}"],
+	stdout  => \$rev,
+	stderr  => \*STDERR,
+);
+exit($status_rev_parse << 8) if $status_rev_parse;
+chomp $rev;
+
+my $log_str;
+my $status_rev_log = exec_wrapper(
+	command => [qw(git log --reverse --ancestry-path --pretty=tformat:%H%x00%P%x00%an%x00%ae%x00%ai%x00%cn%x00%ce%x00%ci%x00%B%x00%x00%x00 -z), "$rev..$branch_commit"],
+	stdout  => \$log_str,
+	stderr  => \*STDERR,
+);
+exit($status_rev_log << 8) if $status_rev_log;
+
+my @revs;
+for my $rev_str (split(/\000{4}/, $log_str)) {
+	my ($hash, $parents, $author_name, $author_email, $author_date, $committer_name, $committer_email, $committer_date, $msg) = split(/\000/, $rev_str, -1);
+	my @parent_revs = split(/\s+/, $parents);
+	my $first_parent = shift @parent_revs;
+	my @msg_lines;
+	for my $line (split(/\n/, $msg)) {
+		if ($line =~ /\[merge: ([[:xdigit:]]+)\]/) {
+			push @parent_revs, $1;
+		} else {
+			push @msg_lines, $line;
+		}
+	}
+	push @revs, {
+		hash => $hash,
+		author_name => $author_name,
+		author_email => $author_email,
+		author_date => $author_date,
+		committer_name => $committer_name,
+		committer_email => $committer_email,
+		committer_date => $committer_date,
+		msg => join("\n", @msg_lines),
+		first_parent => $first_parent,
+		extra_parents => \@parent_revs,
+	};
+}
+
+if (scalar @revs == 0) {
+	fatal("No commits found");
+}
+
+my $last_rev = $revs[0]->{first_parent};
+
+for my $rev_info (@revs) {
+	my $rev = $rev_info->{hash};
+
+	my @parent_opts;
+	if (defined $last_rev) {
+		push @parent_opts, '-p';
+		push @parent_opts, $last_rev;
+	}
+	for (@{$rev_info->{extra_parents}}) {
+		push @parent_opts, '-p';
+		push @parent_opts, $_;
+	}
+
+	local $ENV{GIT_AUTHOR_DATE} = $rev_info->{author_date};
+	local $ENV{GIT_AUTHOR_NAME} = $rev_info->{author_name};
+	local $ENV{GIT_AUTHOR_EMAIL} = $rev_info->{author_email};
+	local $ENV{GIT_COMMITTER_DATE} = $rev_info->{committer_date} if $keep_committer;
+	local $ENV{GIT_COMMITTER_NAME} = $rev_info->{committer_name} if $keep_committer;
+	local $ENV{GIT_COMMITTER_EMAIL} = $rev_info->{committer_email} if $keep_committer;
+
+	my $new_rev;
+	my $status_commit = exec_wrapper(
+		command => [qw(git commit-tree), @parent_opts, '-m', $rev_info->{msg}, "$rev^{tree}"],
+		stdout  => \$new_rev,
+		stderr  => \*STDERR,
+	);
+	exit($status_commit << 8) if $status_commit;
+	chomp $new_rev;
+
+	$last_rev = $new_rev;
+}
+
+if ($dry_run) {
+	print "\nNot resetting $branch_name.\n\nNew commit: '$last_rev'\n";
+	exit 0;
+}
+
+my $status_reset = exec_wrapper(
+	command => [qw(git update-ref -m), "git-unremove-merges: resetting $branch_name to $last_rev", $branch_ref, $last_rev, $branch_commit],
+	stderr  => \*STDERR,
+);
+exit($status_reset << 8) if $status_reset;
+
+exit 0;
+
+sub exec_wrapper {
+	my %opts = @_;
+	if ($verbose >= 1) {
+		my $command;
+		eval {
+			require String::ShellQuote;
+			$command = String::ShellQuote::shell_quote(@{ $opts{command} });
+		};
+		$command = join(" ", @{ $opts{command} }) unless defined $command;
+		print STDERR "Executing: $command\n";
+	}
+	my $status = Proc::Hevy->exec(%opts);
+	if ($verbose >= 2 && defined $opts{stdout} && ref $opts{stdout} eq "SCALAR") {
+		print STDERR "STDOUT: '" . ${ $opts{stdout} } . "'\n";
+	}
+	return $status;
+}
+
+sub fatal {
+	my ($msg) = @_;
+	print STDERR "$msg\n";
+	exit 1;
+}

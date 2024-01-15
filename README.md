@@ -1,6 +1,14 @@
 ## git-remove-merges
 **Remove merges from a linear series of commits**  
 
+### Use case:
+
+The intended use case is to make it easier to rebase/reorder/modify commit sequences which include non-trivial merges.
+
+`git remove-merges` can be used to remove the second and later parents from a linear commit sequence.  
+This enables simple commit manipulation using tools such as `git rebase -i`.  
+`git unremove-merges` can then be used to re-add previously removed parents.
+
 ### Usage:
 
     git remove-merges [options] commit
